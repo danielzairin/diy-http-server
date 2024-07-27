@@ -47,6 +47,29 @@ function parseHTTPReq(requestHead: Buffer): HTTPRequest {
     };
 }
 
+type BufferGenerator = AsyncGenerator<Buffer, void, void>;
+
+async function* countSheep() {
+    for (let i = 0; i < 100; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        yield Buffer.from(`${i}\n`);
+    }
+}
+
+function readerFromGenerator(gen: BufferGenerator): BodyReader {
+    return {
+        len: -1,
+        read: async (): Promise<Buffer> => {
+            const r = await gen.next();
+            if (r.done) {
+                return Buffer.from("");
+            }
+            assert(r.value.length > 0);
+            return r.value;
+        },
+    };
+}
+
 async function handleRequest(
     req: HTTPRequest,
     reqBody: BodyReader
@@ -61,6 +84,9 @@ async function handleRequest(
     switch (req.path) {
         case "/echo":
             body = reqBody;
+            break;
+        case "/sheep":
+            body = readerFromGenerator(countSheep());
             break;
         default:
             const message = Buffer.from("Hello world!\n");
@@ -162,11 +188,11 @@ function getRequestBody(
     }
 
     if (isChunked) {
-        throw Error("TODO");
+        return readerFromGenerator(readChunks(conn, dynamicBuffer));
     }
 
     // Rest of the connection i.e. no content length, no chunked encoding
-    throw Error("TODO");
+    return readerFromConnEOF(conn, dynamicBuffer);
 }
 
 function readerFromConnLength(
@@ -192,6 +218,77 @@ function readerFromConnLength(
             }
             const consume = Math.min(dynamicBuffer.len, remaining);
             remaining -= consume;
+            return dynBuf.unshiftData(dynamicBuffer, consume);
+        },
+    };
+}
+
+async function* readChunks(
+    conn: TCPConn,
+    dynamicBuffer: DynamicBuffer
+): BufferGenerator {
+    while (true) {
+        const idx = dynamicBuffer.data
+            .subarray(0, dynamicBuffer.len)
+            .indexOf("\r\n");
+        if (idx < 0) {
+            // try to get some data if there is none
+            const data = await readTCPConn(conn);
+            dynBuf.pushData(dynamicBuffer, data);
+            if (data.length === 0) {
+                // expect more data!
+                throw new Error("Unexpected EOF from HTTP body");
+            }
+            continue;
+        }
+
+        let chunkLen = Number(
+            dynBuf.unshiftData(dynamicBuffer, idx).toString()
+        );
+        if (isNaN(chunkLen)) {
+            throw Error(`invalid chunk length ${chunkLen}`);
+        }
+        if (chunkLen === 0) {
+            // Last chunk, stop reading and unshift the last \r\n
+            dynBuf.unshiftData(dynamicBuffer, 2);
+            break;
+        }
+
+        let remain = chunkLen;
+        while (remain > 0) {
+            if (dynamicBuffer.len === 0) {
+                // Need more data from dynamic buffer
+                continue;
+            }
+
+            const consume = Math.min(dynamicBuffer.len, remain);
+            const data = dynBuf.unshiftData(dynamicBuffer, consume);
+            remain -= consume;
+            yield data;
+        }
+
+        // Unshift the \r\n
+        dynBuf.unshiftData(dynamicBuffer, 2);
+    }
+}
+
+function readerFromConnEOF(
+    conn: TCPConn,
+    dynamicBuffer: DynamicBuffer
+): BodyReader {
+    return {
+        len: -1,
+        read: async () => {
+            if (dynamicBuffer.len === 0) {
+                // try to get some data if there is none
+                const data = await readTCPConn(conn);
+                dynBuf.pushData(dynamicBuffer, data);
+                if (data.length === 0) {
+                    // expect more data!
+                    throw new Error("Unexpected EOF from HTTP body");
+                }
+            }
+            const consume = dynamicBuffer.len;
             return dynBuf.unshiftData(dynamicBuffer, consume);
         },
     };
